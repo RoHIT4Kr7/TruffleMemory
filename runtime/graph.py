@@ -407,6 +407,8 @@ class LangGraphChatEngine:
     def _build_user_prompt(self, state: ChatState) -> str:
         self_aliases = _collect_self_aliases_from_state(state)
         self_aliases_text = ", ".join(self_aliases) if self_aliases else "(unknown)"
+        candidate_contacts = _extract_contact_candidates(state.get("user_query", ""))
+        candidate_text = ", ".join(candidate_contacts) if candidate_contacts else "(none)"
 
         history_lines = []
         for item in state.get("history", [])[-6:]:
@@ -426,6 +428,7 @@ class LangGraphChatEngine:
         return (
             f"USER QUERY:\n{state['user_query']}\n\n"
             f"SELF IDENTIFIERS (never treat as contacts):\n{self_aliases_text}\n\n"
+            f"CANDIDATE CONTACTS FROM QUERY (if any):\n{candidate_text}\n\n"
             f"PROFILE:\n{state.get('profile_text', '{}')}\n\n"
             f"RECENT CHAT HISTORY:\n{history_text}\n\n"
             f"RETRIEVED MEMORY BLOCKS:\n{context_text}\n\n"
@@ -433,7 +436,8 @@ class LangGraphChatEngine:
             "1) Use only grounded memory blocks.\n"
             "2) If memory is insufficient, set needs_recall=true with a specific recall_query.\n"
             "3) Never classify a self-identifier as a friend/contact.\n"
-            "4) If user asks for secrets, refuse safely.\n"
+            "4) If candidate contacts are provided, compare only those names.\n"
+            "5) If user asks for secrets, refuse safely.\n"
         )
 
     def _estimate_prompt_metrics(
@@ -655,12 +659,21 @@ def _guard_self_as_contact_answer(
         return clean_answer, False
     if not self_aliases:
         return clean_answer, False
-    if not _query_is_contact_ranking(query):
+    candidates = _extract_contact_candidates(query)
+    if not _query_is_contact_ranking(query) and not candidates:
         return clean_answer, False
 
     for alias in self_aliases:
         if not _answer_mentions_alias(clean_answer, alias):
             continue
+        if candidates and not _alias_present_in_candidates(alias, candidates):
+            listed = ", ".join(candidates[:6])
+            guarded = (
+                f"You asked me to compare only these contacts: {listed}. "
+                f"I won't include {alias}. Based on current grounded evidence, "
+                "I can't rank the listed contacts confidently yet."
+            )
+            return guarded, True
         guarded = (
             f"I won't count {alias} as a contact because that's you. "
             "Excluding self, I need grounded evidence across your other contacts before naming a best friend. "
@@ -669,6 +682,65 @@ def _guard_self_as_contact_answer(
         return guarded, True
 
     return clean_answer, False
+
+
+def _extract_contact_candidates(query: str) -> list[str]:
+    raw = str(query).strip()
+    if not raw:
+        return []
+    match = re.search(r"\b(?:among|amongst|between)\b\s+(.+)", raw, flags=re.IGNORECASE)
+    if not match:
+        return []
+
+    tail = match.group(1).strip()
+    tail = re.split(r"[?.!]", tail, maxsplit=1)[0]
+    if not tail:
+        return []
+
+    parts = re.split(r",|\band\b|\bor\b|\bvs\b|/|&", tail, flags=re.IGNORECASE)
+    blocked = {
+        "all",
+        "my",
+        "our",
+        "contacts",
+        "contact",
+        "friends",
+        "friend",
+    }
+    candidates: list[str] = []
+    for part in parts:
+        candidate = str(part).strip(" \t\r\n.,:;!?-_'\"")
+        if not candidate:
+            continue
+        tokens = [tok for tok in candidate.split() if tok]
+        if not tokens:
+            continue
+        filtered = [tok for tok in tokens if tok.lower() not in blocked]
+        if not filtered:
+            continue
+        if len(filtered) > 4:
+            filtered = filtered[:4]
+        cleaned = " ".join(filtered).strip()
+        if cleaned:
+            candidates.append(cleaned)
+    return _merge_self_aliases(candidates)[:8]
+
+
+def _alias_present_in_candidates(alias: str, candidates: list[str]) -> bool:
+    alias_norm = _norm_query(alias)
+    if not alias_norm:
+        return False
+    for candidate in candidates:
+        cand_norm = _norm_query(candidate)
+        if not cand_norm:
+            continue
+        if alias_norm == cand_norm:
+            return True
+        alias_tokens = set(alias_norm.split())
+        cand_tokens = set(cand_norm.split())
+        if alias_tokens and cand_tokens and alias_tokens.issubset(cand_tokens):
+            return True
+    return False
 
 
 def _coerce_content(content: Any) -> str:
