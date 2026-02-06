@@ -21,6 +21,7 @@ class ChatState(TypedDict, total=False):
     history: list[dict[str, str]]
     profile_text: str
     contexts: list[dict[str, Any]]
+    self_aliases: list[str]
     trace: list[dict[str, Any]]
     retrieved_episode_ids: list[str]
     retrieved_summary_ids: list[str]
@@ -168,6 +169,7 @@ class LangGraphChatEngine:
         return {
             "profile_text": result.profile_text,
             "contexts": result.contexts,
+            "self_aliases": result.self_aliases,
             "trace": list(state.get("trace", []))
             + ([cache_event] if cache_event else [])
             + result.trace
@@ -249,6 +251,11 @@ class LangGraphChatEngine:
 
         if payload is None:
             fallback_answer = sanitize_answer(content)
+            fallback_answer, _self_guarded = _guard_self_as_contact_answer(
+                query=state["user_query"],
+                answer=fallback_answer,
+                self_aliases=_collect_self_aliases_from_state(state),
+            )
             confidence = _infer_answer_confidence(
                 payload=None,
                 answer=fallback_answer,
@@ -284,6 +291,11 @@ class LangGraphChatEngine:
             }
 
         answer = str(payload.get("answer", "")).strip()
+        answer, _self_guarded = _guard_self_as_contact_answer(
+            query=state["user_query"],
+            answer=answer,
+            self_aliases=_collect_self_aliases_from_state(state),
+        )
         needs_recall = bool(payload.get("needs_recall", False))
         recall_query = str(payload.get("recall_query", "")).strip()
         confidence = _infer_answer_confidence(
@@ -377,6 +389,10 @@ class LangGraphChatEngine:
             "trace": merged_trace,
             "retrieved_episode_ids": merged_ids,
             "retrieved_summary_ids": merged_summary_ids,
+            "self_aliases": _merge_self_aliases(
+                state.get("self_aliases", []),
+                result.self_aliases,
+            ),
             "recall_count": state.get("recall_count", 0) + 1,
             "pending_recall_query": "",
             "retrieval_scope_mode": result.scope_mode,
@@ -389,6 +405,9 @@ class LangGraphChatEngine:
         return "recall" if state.get("pending_recall_query") else "done"
 
     def _build_user_prompt(self, state: ChatState) -> str:
+        self_aliases = _collect_self_aliases_from_state(state)
+        self_aliases_text = ", ".join(self_aliases) if self_aliases else "(unknown)"
+
         history_lines = []
         for item in state.get("history", [])[-6:]:
             role = item.get("role", "user")
@@ -406,13 +425,15 @@ class LangGraphChatEngine:
 
         return (
             f"USER QUERY:\n{state['user_query']}\n\n"
+            f"SELF IDENTIFIERS (never treat as contacts):\n{self_aliases_text}\n\n"
             f"PROFILE:\n{state.get('profile_text', '{}')}\n\n"
             f"RECENT CHAT HISTORY:\n{history_text}\n\n"
             f"RETRIEVED MEMORY BLOCKS:\n{context_text}\n\n"
             "Instructions:\n"
             "1) Use only grounded memory blocks.\n"
             "2) If memory is insufficient, set needs_recall=true with a specific recall_query.\n"
-            "3) If user asks for secrets, refuse safely.\n"
+            "3) Never classify a self-identifier as a friend/contact.\n"
+            "4) If user asks for secrets, refuse safely.\n"
         )
 
     def _estimate_prompt_metrics(
@@ -526,6 +547,128 @@ class LangGraphChatEngine:
             for item in self._retrieval_cache
             if (now - item.created_at) <= self._retrieval_cache_ttl_seconds
         ]
+
+
+def _merge_self_aliases(*groups: object) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        if isinstance(group, str):
+            values = [group]
+        elif isinstance(group, list):
+            values = [str(item) for item in group]
+        else:
+            continue
+
+        for raw in values:
+            alias = str(raw).strip()
+            key = _norm_query(alias)
+            if not key:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(alias)
+    return merged
+
+
+def _collect_self_aliases_from_state(state: ChatState) -> list[str]:
+    aliases = _merge_self_aliases(state.get("self_aliases", []))
+    for item in state.get("history", [])[-12:]:
+        if str(item.get("role", "")).strip().lower() != "user":
+            continue
+        aliases = _merge_self_aliases(aliases, _extract_explicit_self_aliases(str(item.get("content", ""))))
+    aliases = _merge_self_aliases(aliases, _extract_explicit_self_aliases(str(state.get("user_query", ""))))
+    return aliases[:8]
+
+
+def _extract_explicit_self_aliases(text: str) -> list[str]:
+    if not text:
+        return []
+
+    patterns = (
+        r"\b([A-Za-z][A-Za-z .'-]{1,60}?)\s+is\s+me(?:\b|$)",
+        r"\b(?:i am|i'm)\s+([A-Za-z][A-Za-z .'-]{1,60})(?:\b|$)",
+        r"\bmy name is\s+([A-Za-z][A-Za-z .'-]{1,60})(?:\b|$)",
+        r"\bits me\s+([A-Za-z][A-Za-z .'-]{1,60})(?:\b|$)",
+    )
+    aliases: list[str] = []
+    for pattern in patterns:
+        for match in re.findall(pattern, text, flags=re.IGNORECASE):
+            alias = _clean_self_alias(str(match))
+            if alias:
+                aliases.append(alias)
+    return _merge_self_aliases(aliases)
+
+
+def _clean_self_alias(value: str) -> str:
+    cleaned = str(value).strip(" \t\r\n.,:;!?-_'\"")
+    tokens = [token for token in cleaned.split() if token]
+    if not tokens:
+        return ""
+    if tokens[-1].lower() in {"myself", "me"}:
+        tokens = tokens[:-1]
+    if not tokens:
+        return ""
+    if len(tokens) > 5:
+        tokens = tokens[:5]
+    alias = " ".join(tokens).strip()
+    return alias if len(alias) >= 2 else ""
+
+
+def _query_is_contact_ranking(query: str) -> bool:
+    qn = _norm_query(query)
+    if not qn:
+        return False
+    phrases = (
+        "best friend",
+        "closest friend",
+        "closest contact",
+        "among contacts",
+        "amongst contacts",
+        "among all contacts",
+        "amongst all contacts",
+        "my contacts",
+        "most interacted",
+        "most interaction",
+        "talk to most",
+    )
+    return any(phrase in qn for phrase in phrases)
+
+
+def _answer_mentions_alias(answer: str, alias: str) -> bool:
+    alias_norm = _norm_query(alias)
+    if len(alias_norm) < 3:
+        return False
+    answer_norm = _norm_query(answer)
+    return re.search(rf"\b{re.escape(alias_norm)}\b", answer_norm) is not None
+
+
+def _guard_self_as_contact_answer(
+    *,
+    query: str,
+    answer: str,
+    self_aliases: list[str],
+) -> tuple[str, bool]:
+    clean_answer = str(answer).strip()
+    if not clean_answer:
+        return clean_answer, False
+    if not self_aliases:
+        return clean_answer, False
+    if not _query_is_contact_ranking(query):
+        return clean_answer, False
+
+    for alias in self_aliases:
+        if not _answer_mentions_alias(clean_answer, alias):
+            continue
+        guarded = (
+            f"I won't count {alias} as a contact because that's you. "
+            "Excluding self, I need grounded evidence across your other contacts before naming a best friend. "
+            "Ask me to compare specific names and I will answer with memory evidence."
+        )
+        return guarded, True
+
+    return clean_answer, False
 
 
 def _coerce_content(content: Any) -> str:

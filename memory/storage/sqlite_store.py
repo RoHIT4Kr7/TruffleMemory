@@ -568,6 +568,45 @@ class SQLiteStore:
             ).fetchall()
         return [(str(row["sender"]), int(row["count"])) for row in rows]
 
+    def fetch_likely_self_senders(self, limit: int = 3, min_chats: int = 2) -> list[str]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT sender, COUNT(*) AS msg_count, COUNT(DISTINCT chat_id) AS chat_count
+                FROM messages
+                WHERE sender IS NOT NULL
+                  AND TRIM(sender) <> ''
+                  AND is_system = 0
+                GROUP BY sender
+                HAVING chat_count >= ?
+                ORDER BY chat_count DESC, msg_count DESC
+                LIMIT ?
+                """,
+                (max(1, int(min_chats)), max(1, int(limit))),
+            ).fetchall()
+
+            if not rows:
+                rows = conn.execute(
+                    """
+                    SELECT sender, COUNT(*) AS msg_count, COUNT(DISTINCT chat_id) AS chat_count
+                    FROM messages
+                    WHERE sender IS NOT NULL
+                      AND TRIM(sender) <> ''
+                      AND is_system = 0
+                    GROUP BY sender
+                    ORDER BY chat_count DESC, msg_count DESC
+                    LIMIT ?
+                    """,
+                    (max(1, int(limit)),),
+                ).fetchall()
+
+        aliases: list[str] = []
+        for row in rows:
+            sender = str(row["sender"]).strip()
+            if sender:
+                aliases.append(sender)
+        return aliases
+
     def fetch_top_facts(self, limit: int = 80) -> list[tuple[str, float]]:
         with self.connect() as conn:
             rows = conn.execute(

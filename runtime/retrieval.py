@@ -17,6 +17,7 @@ class RetrievalPack:
     contexts: list[dict[str, Any]]
     episode_ids: list[str]
     summary_ids: list[str]
+    self_aliases: list[str]
     trace: list[dict[str, Any]]
     scope_mode: str
     scope_chat_id: str
@@ -158,12 +159,14 @@ class MemoryRetriever:
         profile_text = ""
         if include_profile and not scoped_chat_id:
             profile_text = self._load_profile_text()
+        self_aliases = self.sqlite.fetch_likely_self_senders(limit=3, min_chats=2)
 
         return RetrievalPack(
             profile_text=profile_text,
             contexts=contexts,
             episode_ids=chosen_episode_ids,
             summary_ids=summary_ids,
+            self_aliases=self_aliases,
             trace=trace,
             scope_mode=scope_mode,
             scope_chat_id=scoped_chat_id or "",

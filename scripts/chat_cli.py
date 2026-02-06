@@ -242,6 +242,9 @@ def _ask_with_fillers(session: ChatSession, query: str) -> tuple[str, list[dict[
     last_fill = started
     fill_idx = 0
     seen_output = False
+    max_fillers = 2
+    first_fill_delay = 2.5
+    fill_interval = 6.0
 
     while worker.is_alive() or not token_queue.empty():
         try:
@@ -254,7 +257,12 @@ def _ask_with_fillers(session: ChatSession, query: str) -> tuple[str, list[dict[
             pass
 
         now = time.monotonic()
-        if not seen_output and now - started >= 1.8 and now - last_fill >= 3.0:
+        if (
+            not seen_output
+            and fill_idx < max_fillers
+            and now - started >= first_fill_delay
+            and now - last_fill >= fill_interval
+        ):
             filler = _FILLER_LINES[fill_idx % len(_FILLER_LINES)]
             fill_idx += 1
             last_fill = now
