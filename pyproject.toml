@@ -1,0 +1,21 @@
+﻿[project]
+name = "truffle-memory"
+version = "0.1.0"
+description = "Hierarchical personal memory backend with LangGraph recall loop"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "langgraph==1.0.7",
+  "langchain-core==1.2.9",
+  "langchain-openai==1.1.7",
+  "openai==2.17.0",
+  "chromadb==1.4.0",
+  "pydantic==2.12.5",
+  "python-dotenv==1.2.1",
+  "tiktoken==0.12.0",
+  "typer==0.21.1",
+  "rich==14.3.2",
+]
+
+[tool.uv]
+package = false
