@@ -4,20 +4,23 @@ Personal memory backend with hierarchical ingestion, Chroma retrieval, and LangG
 
 ## Quickstart
 
-1. Copy `.env.example` to `.env` and fill `OPENROUTER_API_KEY`.
-2. Put WhatsApp `.txt` exports in `data/whatsapp/`.
-3. Create env and install dependencies with `uv`.
-4. Run fast bootstrap ingestion (no LLM calls):
+1. Add your WhatsApp exports first: create `data/whatsapp/` (inside the memory data area) and place all chat `.txt` files there.
+2. Create a virtual environment and install dependencies:
+   `uv venv`
+   `.\.venv\Scripts\activate`
+   `uv add -r requirements.txt`
+3. Copy `.env.example` to `.env` and set `OPENROUTER_API_KEY`.
+4. Start chat with streaming + benchmark + warmup status:
+   `python scripts/chat_cli.py run --stream --show-metrics --show-status`
+
+Optional manual ingestion commands:
+1. Fast bootstrap ingestion:
    `python scripts/ingest.py run`
-5. Optional deep enrichment in background:
+2. Deep enrichment:
    `python scripts/ingest.py enrich --drain`
-6. Optional weekly consolidation in background:
+3. Weekly consolidation:
    `python scripts/ingest.py consolidate --drain`
-7. Start chat:
-   `python scripts/chat_cli.py`
-8. One-command demo mode (fresh DB + fresh Chroma + autonomous background ingestion/steward):
-   `python scripts/chat_cli.py demo`
-9. `run` and `demo` support streaming + live benchmark box:
+4. One-command demo mode (fresh DB + fresh Chroma + autonomous background ingestion/steward):
    `python scripts/chat_cli.py demo --stream --show-metrics`
    In streaming mode, recall loops are capped for responsiveness during live interaction.
 
