@@ -40,11 +40,18 @@ class MemoryRetriever:
         excluded = exclude_episode_ids or set()
         indexed_chat_ids = set(self.sqlite.list_chat_ids(limit=500))
         scoped_chat_id = _resolve_chat_scope(query, self.known_chat_ids)
+        query_norm = _norm_space(query)
         scope_filter = {"chat_id": scoped_chat_id} if scoped_chat_id else None
+        lexical_queries = _lexical_query_variants(query)
 
         weekly_hits = self.chroma.query_weekly(query, n_results=8, where=scope_filter)
         raw_hits = self.chroma.query_raw(query, n_results=18, where=scope_filter)
-        lexical_hits = self.sqlite.search_episodes_lexical(query, limit=12, chat_id=scoped_chat_id)
+        lexical_hits = _collect_episode_lexical_hits(
+            sqlite=self.sqlite,
+            chat_id=scoped_chat_id,
+            lexical_queries=lexical_queries,
+            limit=12,
+        )
 
         summary_ids = [hit.doc_id for hit in weekly_hits]
         episode_scores: dict[str, float] = {}
@@ -153,6 +160,107 @@ class MemoryRetriever:
             )
             used_tokens += estimate
 
+        # For global person/profile questions, blend a few timeline anchors so
+        # retrieval does not collapse to only recent episodes.
+        if (
+            not scoped_chat_id
+            and _needs_historical_anchors(query_norm)
+            and used_tokens < token_budget
+        ):
+            anchor_rows = self.sqlite.fetch_earliest_episode_per_chat(limit=16)
+            anchor_budget = int(token_budget * 0.25)
+            used_anchor_tokens = 0
+            existing_ids = set(chosen_episode_ids)
+
+            for row in anchor_rows:
+                anchor_id = str(row["id"])
+                if anchor_id in excluded or anchor_id in existing_ids:
+                    continue
+                text = str(row.get("text_raw", "")).strip()
+                if not text:
+                    continue
+                estimate = _estimate_tokens(text)
+                if estimate <= 0:
+                    continue
+                if used_anchor_tokens + estimate > anchor_budget:
+                    continue
+                if used_tokens + estimate > token_budget:
+                    break
+
+                chosen_episode_ids.append(anchor_id)
+                existing_ids.add(anchor_id)
+                contexts.append(
+                    {
+                        "source_type": "episode_anchor",
+                        "source_id": anchor_id,
+                        "score": 0.22,
+                        "text": text,
+                        "metadata": {
+                            "chat_id": row.get("chat_id", ""),
+                            "start_ts": row.get("start_ts", ""),
+                            "end_ts": row.get("end_ts", ""),
+                            "tier": row.get("tier", "pass_through"),
+                            "kind": "historical_anchor",
+                        },
+                    }
+                )
+                used_tokens += estimate
+                used_anchor_tokens += estimate
+                trace.append(
+                    {
+                        "source": "historical_anchor",
+                        "id": anchor_id,
+                        "chat_id": str(row.get("chat_id", "")),
+                    }
+                )
+
+        # Warmup fallback: when a specific chat is asked before its episodes are indexed,
+        # pull message-level evidence so basic chat-grounded answers can still work.
+        if scoped_chat_id and (scope_mode == "chat_scoped_pending" or len(contexts) < 4):
+            message_hits = _collect_message_lexical_hits(
+                sqlite=self.sqlite,
+                chat_id=scoped_chat_id,
+                lexical_queries=lexical_queries[:2],
+                limit=28,
+            )
+            message_budget = int(token_budget * (0.45 if scope_mode == "chat_scoped_pending" else 0.22))
+            message_budget = max(0, min(message_budget, token_budget - used_tokens))
+            used_message_tokens = 0
+
+            for hit in message_hits:
+                text = _message_context_text(hit)
+                estimate = _estimate_tokens(text)
+                if estimate <= 0:
+                    continue
+                if used_message_tokens + estimate > message_budget:
+                    break
+                contexts.append(
+                    {
+                        "source_type": "message",
+                        "source_id": str(hit["id"]),
+                        "score": float(hit.get("score", 0.0)),
+                        "text": text,
+                        "metadata": {
+                            "chat_id": scoped_chat_id,
+                            "timestamp": str(hit.get("timestamp", "")),
+                            "sender": str(hit.get("sender") or "unknown"),
+                            "kind": "message_lexical_fallback",
+                        },
+                    }
+                )
+                used_message_tokens += estimate
+                used_tokens += estimate
+
+            if message_hits:
+                for row in message_hits[:8]:
+                    trace.append(
+                        {
+                            "source": "message_fallback",
+                            "id": str(row["id"]),
+                            "score": float(row.get("score", 0.0)),
+                        }
+                    )
+
         self.sqlite.log_retrieval(query, summary_ids=summary_ids, episode_ids=chosen_episode_ids)
 
         profile_text = ""
@@ -180,6 +288,58 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+def _collect_episode_lexical_hits(
+    *,
+    sqlite: SQLiteStore,
+    chat_id: str | None,
+    lexical_queries: list[str],
+    limit: int,
+) -> list[dict[str, Any]]:
+    by_id: dict[str, dict[str, Any]] = {}
+    for idx, lexical_query in enumerate(lexical_queries):
+        weight = 1.0 if idx == 0 else 0.82
+        rows = sqlite.search_episodes_lexical(lexical_query, limit=limit, chat_id=chat_id)
+        for row in rows:
+            eid = str(row["id"])
+            score = float(row.get("score", 0.0)) * weight
+            existing = by_id.get(eid)
+            if existing is None or score > float(existing.get("score", 0.0)):
+                by_id[eid] = {**dict(row), "score": score}
+    ranked = sorted(by_id.values(), key=lambda item: float(item.get("score", 0.0)), reverse=True)
+    return ranked[: limit * 2]
+
+
+def _collect_message_lexical_hits(
+    *,
+    sqlite: SQLiteStore,
+    chat_id: str,
+    lexical_queries: list[str],
+    limit: int,
+) -> list[dict[str, Any]]:
+    by_id: dict[str, dict[str, Any]] = {}
+    queries = lexical_queries or [""]
+    for idx, lexical_query in enumerate(queries):
+        weight = 1.0 if idx == 0 else 0.85
+        rows = sqlite.search_messages_lexical(lexical_query, chat_id=chat_id, limit=limit)
+        for row in rows:
+            mid = str(row["id"])
+            score = float(row.get("score", 0.0)) * weight
+            existing = by_id.get(mid)
+            if existing is None or score > float(existing.get("score", 0.0)):
+                by_id[mid] = {**dict(row), "score": score}
+    ranked = sorted(by_id.values(), key=lambda item: float(item.get("score", 0.0)), reverse=True)
+    return ranked[: limit]
+
+
+def _message_context_text(row: dict[str, Any]) -> str:
+    ts = str(row.get("timestamp", "")).strip()
+    sender = str(row.get("sender") or "unknown").strip() or "unknown"
+    content = str(row.get("content_raw", "")).strip()
+    if len(content) > 360:
+        content = content[:357] + "..."
+    return f"[{ts}] {sender}: {content}"
+
+
 def _parse_episode_ids(raw: object) -> list[str]:
     if isinstance(raw, list):
         return [str(item) for item in raw]
@@ -195,6 +355,59 @@ def _parse_episode_ids(raw: object) -> list[str]:
         except json.JSONDecodeError:
             return [stripped]
     return []
+
+
+def _lexical_query_variants(query: str) -> list[str]:
+    base = str(query).strip()
+    if not base:
+        return [""]
+
+    variants = [base]
+    qn = _norm_space(base)
+
+    if any(term in qn for term in ("best friend", "closest friend", "closest contact", "most interacted")):
+        variants.append(f"{base} friend close trust support")
+
+    if any(term in qn for term in ("owe", "owed", "borrow", "money", "pay", "payment", "upi", "loan")):
+        variants.append(f"{base} money owe pay transfer upi")
+
+    if any(term in qn for term in ("subject", "study", "syllabus", "exam", "class", "do")):
+        variants.append(f"{base} subject syllabus study exam")
+
+    if any(term in qn for term in ("foul", "abuse", "gaali", "worst language", "bad language")):
+        variants.append(f"{base} abuse foul language gaali")
+
+    if any(term in qn for term in ("summarise", "summarize", "conversation", "talked")):
+        variants.append(f"{base} conversation chat discussed talked")
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for variant in variants:
+        key = _norm_space(variant)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(variant)
+    return deduped[:3]
+
+
+def _needs_historical_anchors(query_norm: str) -> bool:
+    if not query_norm:
+        return False
+    phrases = (
+        "all contacts",
+        "among all contacts",
+        "all friends",
+        "among friends",
+        "best friend",
+        "closest friend",
+        "what do you know about me",
+        "about me",
+        "who am i",
+        "across all chats",
+        "overall",
+    )
+    return any(phrase in query_norm for phrase in phrases)
 
 
 def _resolve_chat_scope(query: str, chat_ids: list[str]) -> str | None:

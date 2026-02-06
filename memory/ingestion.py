@@ -6,7 +6,8 @@ from datetime import datetime
 import hashlib
 import logging
 from pathlib import Path
-from typing import Any
+import re
+from typing import Any, Callable
 
 from config.settings import Settings, get_settings
 from memory.chunker import chunk_messages
@@ -56,12 +57,24 @@ class IngestionPipeline:
         self.llm = OpenRouterLLM(self.settings)
         self.summarizer = EpisodeSummarizer(self.llm if self.llm.enabled else None)
 
-    def ingest_all(self, force: bool = False) -> IngestionStats:
+    def ingest_all(
+        self,
+        force: bool = False,
+        *,
+        priority_chat_ids: list[str] | None = None,
+        priority_supplier: Callable[[], list[str]] | None = None,
+    ) -> IngestionStats:
         stats = IngestionStats()
-        files = sorted(self.settings.whatsapp_dir.glob("*.txt"))
-        stats.files_seen = len(files)
+        pending_files = sorted(self.settings.whatsapp_dir.glob("*.txt"))
+        stats.files_seen = len(pending_files)
 
-        for file_path in files:
+        static_priority = _normalize_chat_id_set(priority_chat_ids or [])
+
+        while pending_files:
+            dynamic_priority = _normalize_chat_id_set(priority_supplier() if priority_supplier else [])
+            target = static_priority | dynamic_priority
+            file_path = _pick_next_file(pending_files, target)
+            pending_files.remove(file_path)
             result = self.ingest_file(file_path, force=force)
             if result["status"] == "skipped":
                 stats.files_skipped += 1
@@ -75,6 +88,18 @@ class IngestionPipeline:
 
         build_profile_snapshot(self.sqlite, self.settings.profile_path)
         return stats
+
+    def ingest_chat(self, chat_id: str, force: bool = False) -> dict[str, Any]:
+        path = _resolve_chat_file(self.settings.whatsapp_dir, chat_id)
+        if path is None:
+            return {
+                "status": "not_found",
+                "messages": 0,
+                "episodes": 0,
+                "weekly_summaries": 0,
+                "facts": 0,
+            }
+        return self.ingest_file(path, force=force)
 
     def ingest_file(self, file_path: str | Path, force: bool = False) -> dict[str, Any]:
         path = Path(file_path)
@@ -329,3 +354,66 @@ def _compact_unique(items: list[str], limit: int) -> list[str]:
         if len(result) >= limit:
             break
     return result
+
+
+def _pick_next_file(files: list[Path], priority_chat_ids: set[str]) -> Path:
+    if not files:
+        raise ValueError("No files available to pick from.")
+    if not priority_chat_ids:
+        return files[0]
+
+    for path in files:
+        if _norm_chat_id(_chat_id_from_file(path)) in priority_chat_ids:
+            return path
+    return files[0]
+
+
+def _chat_id_from_file(path: Path) -> str:
+    stem = path.stem.strip()
+    prefix = "WhatsApp Chat with "
+    if stem.startswith(prefix):
+        stem = stem[len(prefix) :].strip()
+    return stem
+
+
+def _norm_chat_id(value: str) -> str:
+    lowered = str(value).lower().strip()
+    lowered = lowered.replace("&", " and ").replace("_", " ")
+    cleaned = re.sub(r"[^a-z0-9]+", " ", lowered)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _normalize_chat_id_set(values: list[str]) -> set[str]:
+    return {norm for norm in (_norm_chat_id(v) for v in values) if norm}
+
+
+def _resolve_chat_file(whatsapp_dir: Path, requested_chat_id: str) -> Path | None:
+    target = _norm_chat_id(requested_chat_id)
+    if not target:
+        return None
+
+    files = sorted(whatsapp_dir.glob("*.txt"))
+    exact_match: Path | None = None
+    best_partial: tuple[int, Path] | None = None
+    target_compact = target.replace(" ", "")
+
+    for path in files:
+        chat_id = _chat_id_from_file(path)
+        norm = _norm_chat_id(chat_id)
+        if not norm:
+            continue
+        if norm == target:
+            exact_match = path
+            break
+        norm_compact = norm.replace(" ", "")
+        if target in norm or norm in target or (target_compact and target_compact in norm_compact):
+            overlap = len(set(target.split()) & set(norm.split()))
+            score = max(overlap, min(len(target), len(norm)))
+            if best_partial is None or score > best_partial[0]:
+                best_partial = (score, path)
+
+    if exact_match is not None:
+        return exact_match
+    if best_partial is not None:
+        return best_partial[1]
+    return None

@@ -483,6 +483,26 @@ class SQLiteStore:
             ).fetchall()
         return [str(row["chat_id"]) for row in rows]
 
+    def fetch_earliest_episode_per_chat(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT e.id, e.chat_id, e.start_ts, e.end_ts, e.text_raw, e.salience, e.tier
+                FROM episodes e
+                JOIN (
+                    SELECT chat_id, MIN(end_ts) AS first_end_ts
+                    FROM episodes
+                    GROUP BY chat_id
+                ) firsts
+                  ON firsts.chat_id = e.chat_id
+                 AND firsts.first_end_ts = e.end_ts
+                ORDER BY e.end_ts ASC, e.salience DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def search_episodes_lexical(
         self,
         query: str,
@@ -552,6 +572,65 @@ class SQLiteStore:
                     (like, limit),
                 ).fetchall()
             return [{**dict(row), "score": 0.25} for row in rows]
+
+    def search_messages_lexical(
+        self,
+        query: str,
+        *,
+        chat_id: str,
+        limit: int = 24,
+    ) -> list[dict[str, Any]]:
+        clean_query = str(query).strip()
+        with self.connect() as conn:
+            if self._fts_enabled and clean_query:
+                try:
+                    rows = conn.execute(
+                        """
+                        SELECT m.id, m.chat_id, m.timestamp, m.sender, m.content_raw,
+                               bm25(messages_fts) AS rank
+                        FROM messages_fts
+                        JOIN messages m ON m.id = messages_fts.message_id
+                        WHERE messages_fts MATCH ? AND m.chat_id = ? AND m.is_system = 0
+                        ORDER BY rank
+                        LIMIT ?
+                        """,
+                        (clean_query, chat_id, limit),
+                    ).fetchall()
+                    return [
+                        {
+                            **dict(row),
+                            "score": 1.0 / (1.0 + max(float(row["rank"]), 0.0)),
+                        }
+                        for row in rows
+                    ]
+                except sqlite3.OperationalError:
+                    pass
+
+            if clean_query:
+                like = f"%{clean_query}%"
+                rows = conn.execute(
+                    """
+                    SELECT id, chat_id, timestamp, sender, content_raw
+                    FROM messages
+                    WHERE chat_id = ? AND is_system = 0 AND content_search LIKE ?
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                    """,
+                    (chat_id, like, limit),
+                ).fetchall()
+                return [{**dict(row), "score": 0.25} for row in rows]
+
+            rows = conn.execute(
+                """
+                SELECT id, chat_id, timestamp, sender, content_raw
+                FROM messages
+                WHERE chat_id = ? AND is_system = 0
+                ORDER BY timestamp DESC
+                LIMIT ?
+                """,
+                (chat_id, limit),
+            ).fetchall()
+            return [{**dict(row), "score": 0.15} for row in rows]
 
     def fetch_top_contacts(self, limit: int = 25) -> list[tuple[str, int]]:
         with self.connect() as conn:

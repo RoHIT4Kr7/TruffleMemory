@@ -19,6 +19,8 @@ from runtime.steward import MemorySteward
 class ChatState(TypedDict, total=False):
     user_query: str
     history: list[dict[str, str]]
+    query_intent: str
+    session_user_identity: str
     profile_text: str
     contexts: list[dict[str, Any]]
     trace: list[dict[str, Any]]
@@ -110,8 +112,12 @@ class LangGraphChatEngine:
         self._stream_callback = on_token if stream else None
         effective_max_recall = int(self.settings.max_recall_count)
         if self._stream_mode:
-            # Keep voice/interactive demos responsive while memory warms up.
-            effective_max_recall = min(effective_max_recall, 1)
+            # Keep demos responsive while memory warms up.
+            running_jobs = self.steward.snapshot().running_ingestion_jobs
+            if running_jobs > 0:
+                effective_max_recall = 0
+            else:
+                effective_max_recall = min(effective_max_recall, 1)
 
         initial_state: ChatState = {
             "user_query": user_query,
@@ -138,6 +144,11 @@ class LangGraphChatEngine:
 
     def _node_load_initial(self, state: ChatState) -> ChatState:
         cache_event: dict[str, Any] | None = None
+        query_intent = _classify_query_intent(state["user_query"])
+        session_identity = _extract_session_user_identity(
+            history=state.get("history", []),
+            current_query=state["user_query"],
+        )
         result, cache_event = self._maybe_get_cached_retrieval(
             query=state["user_query"],
             history=state.get("history", []),
@@ -165,11 +176,21 @@ class LangGraphChatEngine:
             contexts=result.contexts,
             recall_count=state.get("recall_count", 0),
         )
+        priority_event: dict[str, Any] | None = None
+        if result.scope_mode == "chat_scoped_pending" and result.scope_chat_id:
+            priority_event = self.steward.prioritize_chat(
+                result.scope_chat_id,
+                reason="scoped_chat_pending_query",
+            )
+
         return {
+            "query_intent": query_intent,
+            "session_user_identity": session_identity,
             "profile_text": result.profile_text,
             "contexts": result.contexts,
             "trace": list(state.get("trace", []))
             + ([cache_event] if cache_event else [])
+            + ([priority_event] if priority_event else [])
             + result.trace
             + steward_reports,
             "retrieved_episode_ids": result.episode_ids,
@@ -297,6 +318,23 @@ class LangGraphChatEngine:
             needs_recall=needs_recall,
         )
         steward_reason = "answer_low_confidence_needs_recall" if needs_recall else "answer_low_confidence_final"
+
+        query_intent = str(state.get("query_intent", "general")).strip() or "general"
+        if _should_force_grounding_gap(
+            query_intent=query_intent,
+            contexts=contexts,
+            confidence=confidence,
+        ):
+            answer = _grounding_gap_message(
+                query_intent=query_intent,
+                session_user_identity=str(state.get("session_user_identity", "")).strip(),
+            )
+            needs_recall = False
+            recall_query = ""
+            confidence["label"] = "low"
+            confidence["score"] = min(float(confidence.get("score", 0.4)), 0.4)
+            confidence["signals"] = list(confidence.get("signals", []))[:7] + ["forced_grounding_gap_guard"]
+
         steward_reports = self.steward.consider_answer_confidence(
             confidence_label=confidence["label"],
             confidence_score=float(confidence["score"]),
@@ -390,6 +428,10 @@ class LangGraphChatEngine:
         return "recall" if state.get("pending_recall_query") else "done"
 
     def _build_user_prompt(self, state: ChatState) -> str:
+        query_intent = str(state.get("query_intent", "general")).strip() or "general"
+        session_identity = str(state.get("session_user_identity", "")).strip() or "(not provided)"
+        intent_hint = _intent_prompt_hint(query_intent)
+
         history_lines = []
         for item in state.get("history", [])[-6:]:
             role = item.get("role", "user")
@@ -407,14 +449,17 @@ class LangGraphChatEngine:
 
         return (
             f"USER QUERY:\n{state['user_query']}\n\n"
+            f"QUERY INTENT:\n{query_intent}\n\n"
+            f"SESSION USER SELF-IDENTIFIER (explicit only):\n{session_identity}\n\n"
             f"PROFILE:\n{state.get('profile_text', '{}')}\n\n"
             f"RECENT CHAT HISTORY:\n{history_text}\n\n"
             f"RETRIEVED MEMORY BLOCKS:\n{context_text}\n\n"
             "Instructions:\n"
             "1) Use only grounded memory blocks.\n"
             "2) If memory is insufficient, set needs_recall=true with a specific recall_query.\n"
-            "3) Treat the live chat speaker as the user; do not map contact names to the user unless explicitly stated in this session.\n"
-            "4) If user asks for secrets, refuse safely.\n"
+            "3) Treat the live chat speaker as the user. Use a name as user identity only if explicitly stated in this session.\n"
+            f"4) {intent_hint}\n"
+            "5) If user asks for secrets, refuse safely.\n"
         )
 
     def _estimate_prompt_metrics(
@@ -528,6 +573,182 @@ class LangGraphChatEngine:
             for item in self._retrieval_cache
             if (now - item.created_at) <= self._retrieval_cache_ttl_seconds
         ]
+
+
+def _classify_query_intent(query: str) -> str:
+    qn = _norm_query(query)
+    if not qn:
+        return "general"
+
+    if any(phrase in qn for phrase in ("best friend", "closest friend", "closest contact", "among friends")):
+        return "relationship_rank"
+    if any(phrase in qn for phrase in ("worst guy", "foul words", "bad language", "abusive")):
+        return "toxicity_rank"
+    if any(phrase in qn for phrase in ("relation", "relationship", "what relation", "who is")):
+        return "relationship_profile"
+    if any(term in qn for term in ("owe", "owed", "borrow", "money", "payment", "loan", "transfer", "upi")):
+        return "financial_obligation"
+    if any(term in qn for term in ("which subject", "subject", "told", "tell", "do")) and any(
+        term in qn for term in ("subject", "syllabus", "study", "class", "exam")
+    ):
+        return "instruction_subject"
+    if any(term in qn for term in ("summarise", "summarize", "summary", "what we talked", "conversation")):
+        return "chat_summary"
+    if any(term in qn for term in ("what do you know about me", "about me", "who am i")):
+        return "self_profile"
+    return "general"
+
+
+def _intent_prompt_hint(intent: str) -> str:
+    key = str(intent).strip().lower()
+    hints = {
+        "relationship_rank": "For ranking friends/contacts, require strong comparative evidence; do not guess if evidence is weak.",
+        "toxicity_rank": "For language/toxicity comparisons, cite only clear textual evidence from the requested chat scope.",
+        "relationship_profile": "For relation questions, distinguish known facts from assumptions and avoid inventing labels.",
+        "financial_obligation": "For money/owing questions, answer only when explicit financial evidence exists.",
+        "instruction_subject": "For instruction/subject questions, identify who told whom and quote grounded supporting details.",
+        "chat_summary": "For summary questions, synthesize themes and notable events from retrieved evidence only.",
+        "self_profile": "For self-profile questions, summarize only supported patterns from memory and avoid over-claims.",
+    }
+    return hints.get(key, "Keep responses concise, grounded, and uncertainty-aware when evidence is thin.")
+
+
+def _extract_session_user_identity(
+    *,
+    history: list[dict[str, str]],
+    current_query: str,
+) -> str:
+    patterns = (
+        r"\b(?:i am|i'm)\s+([A-Za-z][A-Za-z .'-]{1,60})\b",
+        r"\bmy name is\s+([A-Za-z][A-Za-z .'-]{1,60})\b",
+        r"\bthis is\s+([A-Za-z][A-Za-z .'-]{1,60})\b",
+    )
+
+    user_messages: list[str] = []
+    for item in history[-20:]:
+        if str(item.get("role", "")).strip().lower() != "user":
+            continue
+        user_messages.append(str(item.get("content", "")))
+    user_messages.append(str(current_query))
+
+    found = ""
+    for message in user_messages:
+        text = str(message)
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            candidate = _clean_person_name(match.group(1))
+            if candidate and _looks_like_person_name(candidate):
+                found = candidate
+    return found
+
+
+def _clean_person_name(value: str) -> str:
+    cleaned = str(value).strip(" \t\r\n.,:;!?-_'\"")
+    tokens = [tok for tok in cleaned.split() if tok]
+    if not tokens:
+        return ""
+    if len(tokens) > 5:
+        tokens = tokens[:5]
+    return " ".join(tokens)
+
+
+def _looks_like_person_name(value: str) -> bool:
+    tokens = [tok for tok in str(value).split() if tok]
+    if not tokens or len(tokens) > 4:
+        return False
+
+    stopwords = {
+        "that",
+        "this",
+        "logic",
+        "flow",
+        "bullshit",
+        "remove",
+        "part",
+        "thing",
+        "history",
+        "memory",
+        "yourself",
+        "myself",
+    }
+    valid_tokens = 0
+    for token in tokens:
+        lowered = token.lower().strip(".'-")
+        if not lowered or lowered in stopwords:
+            return False
+        if not re.fullmatch(r"[A-Za-z][A-Za-z'-]*", token):
+            return False
+        if len(lowered) >= 2:
+            valid_tokens += 1
+    return valid_tokens >= 1
+
+
+def _should_force_grounding_gap(
+    *,
+    query_intent: str,
+    contexts: list[dict[str, Any]],
+    confidence: dict[str, Any],
+) -> bool:
+    intent = str(query_intent).strip().lower()
+    if intent not in {"relationship_rank", "toxicity_rank", "instruction_subject", "financial_obligation"}:
+        return False
+
+    context_count = len(contexts)
+    peak_score = 0.0
+    for item in contexts:
+        try:
+            peak_score = max(peak_score, float(item.get("score", 0.0)))
+        except (TypeError, ValueError):
+            continue
+
+    label = str(confidence.get("label", "")).strip().lower()
+    score = float(confidence.get("score", 0.0))
+
+    if intent == "relationship_rank":
+        if label == "low":
+            return True
+        return context_count < 6 or (peak_score < 0.46 and score < 0.62)
+    if intent == "toxicity_rank":
+        if label == "low":
+            return True
+        return context_count < 5 or (peak_score < 0.44 and score < 0.58)
+    if intent == "instruction_subject":
+        return context_count < 4 or (peak_score < 0.40 and label == "low")
+    if intent == "financial_obligation":
+        return context_count < 3 or (peak_score < 0.40 and label == "low")
+    return False
+
+
+def _grounding_gap_message(*, query_intent: str, session_user_identity: str) -> str:
+    identity_note = (
+        f"I'll treat '{session_user_identity}' as your explicit session identity. "
+        if session_user_identity
+        else ""
+    )
+    intent = str(query_intent).strip().lower()
+    if intent == "relationship_rank":
+        return (
+            f"{identity_note}I don't have enough grounded comparative evidence yet to rank a best friend confidently. "
+            "Ask me to compare specific names or ask again after memory warmup completes."
+        )
+    if intent == "toxicity_rank":
+        return (
+            f"{identity_note}I don't have enough grounded evidence yet to rank who uses the most foul language in that scope. "
+            "Ask again after that chat is indexed."
+        )
+    if intent == "instruction_subject":
+        return (
+            f"{identity_note}I don't have enough grounded evidence yet to confirm who told whom which subject. "
+            "Ask again after indexing, or provide a date/message hint."
+        )
+    if intent == "financial_obligation":
+        return (
+            f"{identity_note}I don't have explicit grounded financial evidence yet to confirm money owed. "
+            "Ask again after warmup or mention a date context."
+        )
+    return f"{identity_note}I don't have enough grounded evidence yet."
 
 
 def _coerce_content(content: Any) -> str:

@@ -11,7 +11,10 @@ Personal memory backend with hierarchical ingestion, Chroma retrieval, and LangG
    `uv add -r requirements.txt`
 3. Copy `.env.example` to `.env` and set `OPENROUTER_API_KEY`.
 4. Start chat with streaming + benchmark + warmup status:
-   `python scripts/chat_cli.py demo --stream --show-metrics --show-status`
+   `python scripts/chat_cli.py run --stream --show-metrics --show-status`
+
+For a fresh interview-style showcase (reset DB + Chroma + autonomous warmup in one command):
+`python scripts/chat_cli.py demo --stream --show-metrics`
 
 Optional manual ingestion commands:
 
@@ -48,6 +51,7 @@ Autonomy mode:
 Optional env controls:
 
 - `STEWARD_AUTO_BOOTSTRAP=true|false`
+- `STEWARD_MAX_WORKERS=1` (recommended to keep `1` for stable demo latency)
 - `STEWARD_COOLDOWN_SECONDS=45`
 - `STEWARD_ENRICH_BATCH=8`
 - `STEWARD_CONSOLIDATE_BATCH=3`

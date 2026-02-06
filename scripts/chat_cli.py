@@ -38,7 +38,7 @@ def _configure_logging(log_level: str) -> None:
         noisy.propagate = False
 
 
-def _memory_snapshot() -> dict[str, int] | None:
+def _memory_snapshot() -> dict[str, Any] | None:
     settings = get_settings()
     if not settings.sqlite_path.exists():
         return None
@@ -47,6 +47,32 @@ def _memory_snapshot() -> dict[str, int] | None:
         conn = sqlite3.connect(str(settings.sqlite_path), timeout=2)
         conn.execute("PRAGMA busy_timeout=2000;")
         cur = conn.cursor()
+
+        job_rows = cur.execute("SELECT file_path, status FROM ingestion_jobs").fetchall()
+        status_by_file: dict[str, str] = {}
+        for file_path, status in job_rows:
+            name = Path(str(file_path)).name.lower()
+            if name:
+                status_by_file[name] = str(status)
+
+        chat_files = sorted(settings.whatsapp_dir.glob("*.txt"))
+        indexed_chat_names: list[str] = []
+        running_chat_names: list[str] = []
+        failed_chat_names: list[str] = []
+        pending_chat_names: list[str] = []
+
+        for path in chat_files:
+            chat_name = _chat_id_from_export_path(path)
+            status = status_by_file.get(path.name.lower(), "")
+            if status == "completed":
+                indexed_chat_names.append(chat_name)
+            elif status == "running":
+                running_chat_names.append(chat_name)
+            elif status == "failed":
+                failed_chat_names.append(chat_name)
+            else:
+                pending_chat_names.append(chat_name)
+
         snap = {
             "messages": int(cur.execute("SELECT COUNT(*) FROM messages").fetchone()[0]),
             "episodes": int(cur.execute("SELECT COUNT(*) FROM episodes").fetchone()[0]),
@@ -60,6 +86,11 @@ def _memory_snapshot() -> dict[str, int] | None:
             "running_jobs": int(
                 cur.execute("SELECT COUNT(*) FROM ingestion_jobs WHERE status='running'").fetchone()[0]
             ),
+            "total_chats": int(len(chat_files)),
+            "indexed_chats": int(len(indexed_chat_names)),
+            "running_chat_names": running_chat_names[:2],
+            "pending_chat_names": pending_chat_names[:2],
+            "failed_chat_count": int(len(failed_chat_names)),
         }
         conn.close()
         return snap
@@ -67,17 +98,43 @@ def _memory_snapshot() -> dict[str, int] | None:
         return None
 
 
+def _chat_id_from_export_path(path: Path) -> str:
+    stem = path.stem.strip()
+    prefix = "WhatsApp Chat with "
+    if stem.startswith(prefix):
+        stem = stem[len(prefix) :].strip()
+    return stem or path.stem
+
+
 def _print_warmup_line() -> None:
     snap = _memory_snapshot()
     if snap is None:
         console.print("[dim]I'm learning your memory in the background...[/dim]")
         return
-    console.print(
-        "[dim]Memory warmup: "
+    line = (
+        "Memory warmup: "
         f"messages={snap['messages']} episodes={snap['episodes']} "
         f"summaries={snap['episodic']} weekly={snap['weekly']} facts={snap['facts']} "
-        f"running_jobs={snap['running_jobs']}[/dim]"
+        f"running_jobs={snap['running_jobs']}"
     )
+    total_chats = int(snap.get("total_chats", 0))
+    indexed_chats = int(snap.get("indexed_chats", 0))
+    if total_chats > 0:
+        line += f" chats_indexed={indexed_chats}/{total_chats}"
+
+    running_chat_names = [str(item) for item in snap.get("running_chat_names", [])]
+    if running_chat_names:
+        line += f" running_chat={', '.join(running_chat_names)}"
+
+    pending_chat_names = [str(item) for item in snap.get("pending_chat_names", [])]
+    if pending_chat_names:
+        line += f" pending_next={', '.join(pending_chat_names)}"
+
+    failed_chat_count = int(snap.get("failed_chat_count", 0))
+    if failed_chat_count > 0:
+        line += f" failed_chats={failed_chat_count}"
+
+    console.print(f"[dim]{line}[/dim]")
 
 
 def _reset_memory_store() -> None:

@@ -27,7 +27,8 @@ class MemorySteward:
         self.settings = settings
         self.sqlite = SQLiteStore(settings.sqlite_path)
         self.pipeline = IngestionPipeline(settings)
-        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="memory-steward")
+        self.max_workers = max(1, _env_int("STEWARD_MAX_WORKERS", 1))
+        self.executor = ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="memory-steward")
         self._lock = threading.Lock()
         self._active: dict[str, Future[Any]] = {}
 
@@ -45,6 +46,7 @@ class MemorySteward:
         self._last_action_at = 0.0
         self._bootstrap_submitted = False
         self._session_started = False
+        self._priority_chat_ids: set[str] = set()
 
     def on_session_start(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -115,6 +117,40 @@ class MemorySteward:
         if not scheduled:
             return None
         return {"source": "memory_steward", "action": "fast_ingest", "scheduled": True, "reason": reason}
+
+    def prioritize_chat(self, chat_id: str, reason: str = "scoped_chat_pending") -> dict[str, Any] | None:
+        clean_chat_id = str(chat_id).strip()
+        if not clean_chat_id:
+            return None
+
+        with self._lock:
+            self._priority_chat_ids.add(clean_chat_id)
+            active_fast = self._active.get("fast_ingest")
+            fast_running = bool(active_fast and not active_fast.done())
+
+        # If fast ingest is not running, schedule a targeted ingest to unblock this chat.
+        if not fast_running:
+            scheduled = self._submit(
+                action="priority_ingest",
+                fn=self._run_priority_ingest,
+                reason=reason,
+                bypass_cooldown=True,
+            )
+            return {
+                "source": "memory_steward",
+                "action": "priority_ingest" if scheduled else "priority_ingest_pending",
+                "scheduled": bool(scheduled),
+                "reason": reason,
+                "chat_id": clean_chat_id,
+            }
+
+        return {
+            "source": "memory_steward",
+            "action": "priority_hint_queued",
+            "scheduled": False,
+            "reason": reason,
+            "chat_id": clean_chat_id,
+        }
 
     def consider_retrieval(
         self,
@@ -279,7 +315,11 @@ class MemorySteward:
             self._active.pop(name, None)
 
     def _run_fast_ingest(self) -> None:
-        self.pipeline.ingest_all(force=False)
+        self.pipeline.ingest_all(
+            force=False,
+            priority_supplier=self._consume_priority_hints_snapshot,
+        )
+        self._consume_priority_hints_once()
         # One small autonomous follow-up pass keeps chat quality improving
         # without turning this into a permanent background process.
         deep_stats = self.pipeline.enrich_deep_episodes(limit=self.enrich_batch)
@@ -291,6 +331,25 @@ class MemorySteward:
 
     def _run_consolidate_weekly(self) -> None:
         self.pipeline.consolidate_weekly_summaries(limit=self.consolidate_batch)
+
+    def _run_priority_ingest(self) -> None:
+        hints = self._consume_priority_hints_once()
+        if not hints:
+            return
+        for chat_id in hints[:2]:
+            result = self.pipeline.ingest_chat(chat_id, force=False)
+            if result.get("status") == "completed":
+                break
+
+    def _consume_priority_hints_snapshot(self) -> list[str]:
+        with self._lock:
+            return list(self._priority_chat_ids)
+
+    def _consume_priority_hints_once(self) -> list[str]:
+        with self._lock:
+            items = list(self._priority_chat_ids)
+            self._priority_chat_ids.clear()
+            return items
 
 
 def _env_bool(name: str, default: bool) -> bool:
