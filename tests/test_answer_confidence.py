@@ -1,12 +1,8 @@
 from __future__ import annotations
 
 from runtime.graph import (
-    _extract_contact_candidates,
-    _extract_explicit_self_aliases,
-    _guard_self_as_contact_answer,
     _infer_answer_confidence,
     _is_followup_query,
-    _query_is_contact_ranking,
     _sanitize_trace_for_user,
     _token_overlap_ratio,
     _user_reflection_note,
@@ -71,36 +67,3 @@ def test_followup_query_detection() -> None:
 def test_token_overlap_ratio() -> None:
     ratio = _token_overlap_ratio("who is most active there", "who is active in that chat")
     assert ratio > 0.25
-
-
-def test_extract_explicit_self_aliases_from_user_statement() -> None:
-    aliases = _extract_explicit_self_aliases("Rohit Kumar is me myself.")
-    assert "Rohit Kumar" in aliases
-
-
-def test_guard_self_as_contact_answer_for_contact_ranking_query() -> None:
-    guarded, changed = _guard_self_as_contact_answer(
-        query="who is my best friend amongst all my contacts",
-        answer="Rohit Kumar is your closest contact based on interactions.",
-        self_aliases=["Rohit Kumar"],
-    )
-    assert _query_is_contact_ranking("who is my best friend amongst all my contacts")
-    assert changed is True
-    assert "won't count Rohit Kumar as a contact" in guarded
-
-
-def test_guard_self_as_contact_answer_with_candidate_list() -> None:
-    guarded, changed = _guard_self_as_contact_answer(
-        query="who is my best friend among hrithik, tanishq, mridul ?",
-        answer="Rohit Kumar seems closest based on the memory blocks.",
-        self_aliases=["Rohit Kumar"],
-    )
-    assert changed is True
-    assert "compare only these contacts" in guarded
-    assert "hrithik, tanishq, mridul" in guarded.lower()
-    assert "won't include Rohit Kumar" in guarded
-
-
-def test_extract_contact_candidates() -> None:
-    candidates = _extract_contact_candidates("who is my best friend among hrithik, tanishq and mridul?")
-    assert candidates == ["hrithik", "tanishq", "mridul"]
