@@ -14,7 +14,7 @@ Personal memory backend with hierarchical ingestion, Chroma retrieval, and LangG
    `python scripts/chat_cli.py run --stream --show-metrics --show-status`
 
 For a fresh interview-style showcase (reset DB + Chroma + autonomous warmup in one command):
-`python scripts/chat_cli.py demo --stream --show-metrics`
+`python scripts/chat_cli.py run --stream --show-metrics`
 
 Optional manual ingestion commands:
 
